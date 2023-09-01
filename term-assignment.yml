@@ -1,0 +1,302 @@
+Resources:
+  MyS3Bucket1:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: uploaded-image-b00945188
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  MyS3Bucket2:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: result-b00945188
+
+  TextractFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: textract
+      Handler: index.lambda_handler
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Runtime: python3.9
+      Timeout: 222
+      Code:
+        ZipFile: |
+          import boto3
+
+          def lambda_handler(event, context):
+              # Retrieve the S3 bucket name and key from the event
+              bucket_name = event['detail']['bucket']['name']
+              object_key = event['detail']['object']['key']
+
+              # Initialize the AWS clients for Textract
+              textract_client = boto3.client('textract')
+
+              # Call Textract to extract text from the image
+              response = textract_client.start_document_text_detection(
+                  DocumentLocation={'S3Object': {
+                      'Bucket': bucket_name, 'Name': object_key}}
+              )
+
+              # Retrieve the job ID from the Textract response
+              job_id = response['JobId']
+
+              # Check the status of the Textract job and retrieve the results once completed
+              while True:
+                  job_status = textract_client.get_document_text_detection(JobId=job_id)
+                  status = job_status['JobStatus']
+
+                  if status in ['SUCCEEDED', 'FAILED']:
+                      break
+
+              # Retrieve the extracted text from the Textract response
+              extracted_text = ''
+              if status == 'SUCCEEDED':
+                  blocks = job_status['Blocks']
+                  for block in blocks:
+                      if block['BlockType'] == 'LINE':
+                          extracted_text += block['Text'] + ' '
+
+              print(extracted_text)
+
+              # Return the extracted text as the response
+              return {
+                  'statusCode': 200,
+                  'body': {
+                      'extracted_text': extracted_text,
+                      'object_key': object_key
+                  }
+              }
+
+  StoreDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: store-data
+      Handler: index.lambda_handler
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          BUCKET_NAME = 'result-b00945188'
+
+          def lambda_handler(event, context):
+              # Retrieve the extracted text from the event payload
+              extracted_text = event['body']['extracted_text']
+              print(extracted_text)
+
+              # Retrieve the object key from the event payload
+              object_key = event['body']['object_key']
+              print(object_key)
+
+              # Initialize the S3 client
+              s3_client = boto3.client('s3')
+
+              # Create a dictionary to store the data
+              data = {
+                  'ImageName': object_key,
+                  'ExtractedText': extracted_text
+              }
+
+              try:
+                  # Store the data in S3 as JSON
+                  response = s3_client.put_object(
+                      Bucket=BUCKET_NAME,
+                      Key=f'{object_key}.json',
+                      Body=json.dumps(data)
+                  )
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error storing data in S3: {str(e)}'
+                  }
+
+              return {
+                  'statusCode': 200,
+                  'body': 'Data stored in S3 successfully.'
+              }
+
+  TextProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: TextProcessingStateMachine
+      RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      DefinitionString: !Sub |
+        {
+          "Comment": "Image Processing State Machine",
+          "StartAt": "WaitForImageUpload",
+          "States": {
+            "WaitForImageUpload": {
+              "Type": "Wait",
+              "Seconds": 1,
+              "Next": "TextractFunction"
+            },
+            "TextractFunction": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:textract",
+              "Next": "StoreDataFunction"
+            },
+            "StoreDataFunction": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:store-data",
+              "End": true
+            }
+          }
+        }
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: "textract-rule"
+      EventPattern: '{"source":["aws.s3"],"detail-type":["Object Created"],"detail":{"bucket":{"name":["uploaded-image-b00945188",""]}}}'
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt TextProcessingStateMachine.Arn
+          Id: "TargetStepFunction"
+          RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+
+  UploadApi:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: "upload-api"
+      ApiKeySourceType: "HEADER"
+      BinaryMediaTypes:
+        - "image/jpeg"
+      EndpointConfiguration:
+        Types:
+          - "REGIONAL"
+
+  UploadApiResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      RestApiId: !Ref UploadApi
+      PathPart: "{bucket}"
+      ParentId: !GetAtt UploadApi.RootResourceId
+
+  UploadApiResource2:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      RestApiId: !Ref UploadApi
+      PathPart: "{filename}"
+      ParentId: !Ref UploadApiResource
+
+  UploadApiMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref UploadApi
+      ResourceId: !Ref UploadApiResource2
+      HttpMethod: "PUT"
+      AuthorizationType: "NONE"
+      ApiKeyRequired: false
+      RequestParameters:
+        "method.request.path.bucket": true
+        "method.request.path.filename": true
+      MethodResponses:
+        - ResponseModels:
+            "application/json": "Empty"
+          StatusCode: "200"
+      Integration:
+        CacheNamespace: !Ref UploadApiResource2
+        Credentials: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+        IntegrationHttpMethod: "PUT"
+        IntegrationResponses:
+          - ResponseTemplates: {}
+            StatusCode: "200"
+        PassthroughBehavior: "WHEN_NO_MATCH"
+        RequestParameters:
+          "integration.request.path.bucket": "method.request.path.bucket"
+          "integration.request.path.key": "method.request.path.filename"
+        TimeoutInMillis: 29000
+        Type: "AWS"
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/{bucket}/{key}"
+
+  UploadApiDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    Properties:
+      RestApiId: !Ref UploadApi
+    DependsOn:
+      - UploadApiMethod
+
+  UploadApiStage:
+    Type: "AWS::ApiGateway::Stage"
+    Properties:
+      StageName: "upload"
+      DeploymentId: !Ref UploadApiDeployment
+      RestApiId: !Ref UploadApi
+      CacheClusterEnabled: false
+      TracingEnabled: false
+
+  GetApi:
+    Type: "AWS::ApiGateway::RestApi"
+    Properties:
+      Name: "get-api"
+      ApiKeySourceType: "HEADER"
+      EndpointConfiguration:
+        Types:
+          - "REGIONAL"
+
+  GetApiResource:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      RestApiId: !Ref GetApi
+      PathPart: "{bucket}"
+      ParentId: !GetAtt GetApi.RootResourceId
+
+  GetApiResource2:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      RestApiId: !Ref GetApi
+      PathPart: "{key}"
+      ParentId: !Ref GetApiResource
+
+  GetApiMethod:
+    Type: "AWS::ApiGateway::Method"
+    Properties:
+      RestApiId: !Ref GetApi
+      ResourceId: !Ref GetApiResource2
+      HttpMethod: "GET"
+      AuthorizationType: "NONE"
+      ApiKeyRequired: false
+      RequestParameters:
+        "method.request.path.bucket": true
+        "method.request.path.key": true
+      MethodResponses:
+        - ResponseModels:
+            "application/json": "Empty"
+          StatusCode: "200"
+      Integration:
+        CacheNamespace: !Ref GetApiResource2
+        Credentials: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
+        IntegrationHttpMethod: "GET"
+        IntegrationResponses:
+          - ResponseTemplates: {}
+            StatusCode: "200"
+        PassthroughBehavior: "WHEN_NO_MATCH"
+        RequestParameters:
+          "integration.request.path.bucket": "method.request.path.bucket"
+          "integration.request.path.key": "method.request.path.key"
+        TimeoutInMillis: 29000
+        Type: "AWS"
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:s3:path/{bucket}/{key}"
+
+  GetApiDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    Properties:
+      RestApiId: !Ref GetApi
+    DependsOn:
+      - GetApiMethod
+
+  GetApiStage:
+    Type: "AWS::ApiGateway::Stage"
+    Properties:
+      StageName: "get"
+      DeploymentId: !Ref GetApiDeployment
+      RestApiId: !Ref GetApi
+      CacheClusterEnabled: false
+      TracingEnabled: false
+
+Outputs:
+  StepFunctionStateMachineArn:
+    Value: !Ref TextProcessingStateMachine
